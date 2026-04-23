@@ -36,6 +36,14 @@ LOGO_FILE = "logo.ico"  # <--- HIER ZAT DE FOUT (ontbrekend aanhalingsteken)
 CONFIG_FILE = "config.json"
 HISTORY_FILE = "history.json"
 
+def resource_path(relative_path):
+    """Geeft het juiste pad terug, of we nu vanuit .py of vanuit een PyInstaller .exe draaien."""
+    try:
+        base_path = sys._MEIPASS  # PyInstaller tijdelijke folder
+    except AttributeError:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
 def save_config(data):
     """Slaat de configuratie op naar config.json."""
     try:
@@ -1117,4 +1125,5 @@ class LEDLoggerApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv); app.setStyle("Fusion")
-    window = LEDLoggerApp(); window.show(); sys.exit(app.exec())
+    app.setWindowIcon(QIcon(resource_path(LOGO_FILE)))
+    window = LEDLoggerApp(); window.setWindowIcon(QIcon(resource_path(LOGO_FILE))); window.show(); sys.exit(app.exec())
