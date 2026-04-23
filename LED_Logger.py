@@ -247,12 +247,13 @@ COEX_OIDS = {
     "ctrl_ip":             "1.3.6.1.4.1.319.10.10.1.8",
     "genlock_status":      "1.3.6.1.4.1.319.10.10.10.9.1",   # 0=disconnected, 1=connected
     "monitor_status":      "1.3.6.1.4.1.319.10.200.6",        # 0=normal, 2=fault (overall)
+    "input_src_status":    "1.3.6.1.4.1.319.10.10.50.2.1.2",  # 1=connected, 0=disconnected (IN1)
     "n_input_cards":       "1.3.6.1.4.1.319.10.100.4",
-    "n_output_cards":      "1.3.6.1.4.1.319.10.100.5",
 }
 
 # Status mapping
 COEX_STATUS_MAP = {0: ("normal", "green"), 1: ("warning", "orange"), 2: ("fault", "red")}
+COEX_TRAP_PORT = 1162
 
 class NovastarCoexSocket(QObject):
     """SNMP-based monitor voor Novastar COEX processors (MX2000 Pro etc.)."""
@@ -265,17 +266,23 @@ class NovastarCoexSocket(QObject):
         self.community = community
         self.active_errors = set()
         self.last_seen_ok = False
+        self.trap_server_configured = False  # auto-configure trap target after first online
+        self._eth_port_bits = {}  # key=(slot, port) -> laatste bitwaarde
+        self._ctrl_name = name
+        self._ctrl_model = name
 
         # Lazy import zodat de app ook werkt zonder pysnmp (alleen Helios)
         try:
             import asyncio
             from pysnmp.hlapi.asyncio import (SnmpEngine, CommunityData, UdpTransportTarget,
-                                              ContextData, ObjectType, ObjectIdentity, getCmd)
+                                              ContextData, ObjectType, ObjectIdentity, getCmd, setCmd)
+            from pysnmp.proto.rfc1902 import OctetString as SnmpOctetString, Integer as SnmpInteger
             self._asyncio = asyncio
             self._snmp = dict(SnmpEngine=SnmpEngine, CommunityData=CommunityData,
                               UdpTransportTarget=UdpTransportTarget, ContextData=ContextData,
                               ObjectType=ObjectType, ObjectIdentity=ObjectIdentity,
-                              getCmd=getCmd)
+                              getCmd=getCmd, setCmd=setCmd,
+                              OctetString=SnmpOctetString, Integer=SnmpInteger)
             self._available = True
         except ImportError as e:
             self._available = False
@@ -289,13 +296,46 @@ class NovastarCoexSocket(QObject):
         # Eerste scan na 1s zodat GUI eerst klaar is
         QTimer.singleShot(1000, self.poll_health)
 
+    def _run_async(self, coro):
+        """Voer een coroutine uit in een tijdelijke event loop en ruim alle pending tasks netjes op.
+        Dit voorkomt 'Task was destroyed but it is pending' warnings van pysnmp's AsyncioDispatcher."""
+        asyncio = self._asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                # 1. Cancel alle nog hangende tasks
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                for t in pending:
+                    t.cancel()
+                # 2. Wacht tot ze daadwerkelijk klaar zijn (cancellation propageren)
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                # 3. Shutdown async generators
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+
     def _snmp_get(self, oid, timeout=2):
         """Eenmalig SNMP GET. Geeft (value, error_str) terug. Sync wrapper rond asyncio."""
         if not self._available:
             return None, "pysnmp missing"
         try:
             S = self._snmp
-            asyncio = self._asyncio
 
             async def _do_get():
                 target = S["UdpTransportTarget"]((self.ip, 161), timeout=timeout, retries=0)
@@ -308,16 +348,7 @@ class NovastarCoexSocket(QObject):
                 )
                 return errInd, errStat, errIdx, varBinds
 
-            # Run in een nieuwe event loop binnen deze (Qt) thread
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                errInd, errStat, errIdx, varBinds = loop.run_until_complete(_do_get())
-            finally:
-                try:
-                    loop.close()
-                except Exception:
-                    pass
+            errInd, errStat, errIdx, varBinds = self._run_async(_do_get())
 
             if errInd:
                 return None, str(errInd)
@@ -328,6 +359,71 @@ class NovastarCoexSocket(QObject):
             return None, "no varbinds"
         except Exception as e:
             return None, str(e)
+
+    def _snmp_set(self, oid, value, value_type="OctetString", timeout=2):
+        """SNMP SET helper. value_type = 'OctetString' of 'Integer'."""
+        if not self._available:
+            return False, "pysnmp missing"
+        try:
+            S = self._snmp
+            if value_type == "Integer":
+                value_obj = S["Integer"](int(value))
+            else:
+                value_obj = S["OctetString"](str(value))
+
+            async def _do_set():
+                target = S["UdpTransportTarget"]((self.ip, 161), timeout=timeout, retries=0)
+                errInd, errStat, errIdx, varBinds = await S["setCmd"](
+                    S["SnmpEngine"](),
+                    S["CommunityData"](self.community, mpModel=1),
+                    target,
+                    S["ContextData"](),
+                    S["ObjectType"](S["ObjectIdentity"](oid), value_obj),
+                )
+                return errInd, errStat, errIdx, varBinds
+
+            errInd, errStat, errIdx, varBinds = self._run_async(_do_set())
+
+            if errInd:
+                return False, str(errInd)
+            if errStat:
+                return False, str(errStat.prettyPrint())
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def _configure_trap_target(self):
+        """Configureer COEX om SNMP traps naar deze PC te sturen."""
+        # Detecteer eigen IP (richting de COEX)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((self.ip, 1))  # geen actuele connectie, alleen routing
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = None
+
+        if not local_ip:
+            return
+
+        target = f"{local_ip}/{COEX_TRAP_PORT}"
+        # SNMP Trap server (OID: 1.3.6.1.4.1.319.10.200.1, OctetString)
+        ok1, err1 = self._snmp_set("1.3.6.1.4.1.319.10.200.1", target, "OctetString")
+        # Trap reporting period (OID: 1.3.6.1.4.1.319.10.200.2, Integer, minutes)
+        ok2, err2 = self._snmp_set("1.3.6.1.4.1.319.10.200.2", 1, "Integer")
+        # Trap On (OID: 1.3.6.1.4.1.319.10.200.4, Integer 1=On)
+        ok3, err3 = self._snmp_set("1.3.6.1.4.1.319.10.200.4", 1, "Integer")
+
+        if ok1 and ok3:
+            self.error_detected.emit("green",
+                f"{self.name}: SNMP trap target auto-configured -> {target}", self.ip)
+            self.trap_server_configured = True
+        else:
+            # Veel COEX firmwares hebben deze OIDs read-only of niet aanwezig.
+            # Markeer als 'configured' om herhaalde foutmeldingen te voorkomen.
+            self.trap_server_configured = True
+            self.error_detected.emit("gray",
+                f"{self.name}: Auto-trap-config niet ondersteund door firmware - stel handmatig in via VMP (Trap server: {target})", self.ip)
 
     def poll_health(self):
         """Vraagt key OIDs op en emit alerts bij verandering."""
@@ -358,14 +454,21 @@ class NovastarCoexSocket(QObject):
             self.last_seen_ok = True
             fw, _ = self._snmp_get(COEX_OIDS["ctrl_fw"])
             ctrl_name, _ = self._snmp_get(COEX_OIDS["ctrl_name"])
+            if ctrl_name:
+                self._ctrl_name = ctrl_name
+            if model:
+                self._ctrl_model = model
             details = []
             if model: details.append(f"Model={model}")
             if ctrl_name: details.append(f"Name={ctrl_name}")
             if fw: details.append(f"FW={fw}")
             extra = " | ".join(details) if details else "responding to SNMP"
             self.error_detected.emit("green", f"{self.name}: Online | {extra}", self.ip)
+            # Auto-configure trap target on first online detection
+            if not self.trap_server_configured:
+                self._configure_trap_target()
 
-        # 2. Overall monitor status (alleen checken als OID bestaat)
+        # 2. Overall monitor status
         val, err = self._snmp_get(COEX_OIDS["monitor_status"])
         if err is None and val is not None:
             try:
@@ -374,11 +477,15 @@ class NovastarCoexSocket(QObject):
                 if status_int == 2:
                     if err_id not in self.active_errors:
                         self.active_errors.add(err_id)
-                        self.error_detected.emit("red", f"{self.name}: Overall status FAULT", self.ip)
+                        self.error_detected.emit("red",
+                            f"Error,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Status FAULT",
+                            self.ip)
                 elif status_int == 0:
                     if err_id in self.active_errors:
                         self.active_errors.discard(err_id)
-                        self.error_detected.emit("green", f"{self.name}: Overall status OK", self.ip)
+                        self.error_detected.emit("green",
+                            f"Recover,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Status NORMAL",
+                            self.ip)
             except (ValueError, TypeError):
                 pass
 
@@ -391,13 +498,76 @@ class NovastarCoexSocket(QObject):
                 if gl == 0:
                     if err_id not in self.active_errors:
                         self.active_errors.add(err_id)
-                        self.error_detected.emit("orange", f"{self.name}: Genlock disconnected", self.ip)
+                        self.error_detected.emit("orange",
+                            f"Warning,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Genlock: Source disconnected",
+                            self.ip)
                 else:
                     if err_id in self.active_errors:
                         self.active_errors.discard(err_id)
-                        self.error_detected.emit("green", f"{self.name}: Genlock connected", self.ip)
+                        self.error_detected.emit("green",
+                            f"Recover,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Genlock: Source connected",
+                            self.ip)
             except ValueError:
                 pass
+
+        # 4. HDMI input source status
+        src_val, src_err = self._snmp_get(COEX_OIDS["input_src_status"])
+        if src_err is None and src_val is not None:
+            try:
+                src_state = int(src_val)
+                src_key = "_input_source_in1"
+                prev_state = self._eth_port_bits.get(src_key)
+                self._eth_port_bits[src_key] = src_state
+                if prev_state is not None and src_state != prev_state:
+                    in_label = "IN1/HDMI2.1 1"
+                    if src_state == 0:
+                        self.error_detected.emit("red",
+                            f"Error,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{in_label}: Source disconnected",
+                            self.ip)
+                    else:
+                        self.error_detected.emit("green",
+                            f"Recover,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{in_label}: Source connected",
+                            self.ip)
+            except (ValueError, TypeError):
+                pass
+
+        # 5. Receiving cards online per ETH port (alleen state bijhouden, geen gesynthetiseerde tekst)
+        # 319.10.10.20.1 = aantal ETH output poorten
+        # 319.10.20.1.2.P.5 = online receiving cards voor poortindex P
+        n_ports_val, n_ports_err = self._snmp_get("1.3.6.1.4.1.319.10.10.20.1")
+        if n_ports_err is None and n_ports_val is not None:
+            try:
+                n_ports = int(n_ports_val)
+            except (ValueError, TypeError):
+                n_ports = 0
+            for p in range(1, n_ports + 1):
+                rc_str, rc_err = self._snmp_get(f"1.3.6.1.4.1.319.10.20.1.2.{p}.5")
+                if rc_err is not None or rc_str is None:
+                    continue
+                try:
+                    rc = int(rc_str)
+                except (ValueError, TypeError):
+                    continue
+                last_key = f"_rc_eth_{p}"
+                prev_rc = self._eth_port_bits.get(last_key)
+                self._eth_port_bits[last_key] = rc
+                if prev_rc is None:
+                    continue  # eerste meting = baseline
+                if rc == prev_rc:
+                    continue
+                port_label = f"OUT1/OPT Port1 Eth Port{p}"
+                panel_label = f"{self._ctrl_name}_P{p}-1"
+                if rc == 0 and prev_rc > 0:
+                    self.error_detected.emit("orange",
+                        f"Warning,Cabinet,{self._ctrl_name},{self._ctrl_model},{self.ip},{panel_label},Packet error: 65535",
+                        self.ip)
+                    self.error_detected.emit("red",
+                        f"Error,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{port_label}: Output disconnected",
+                        self.ip)
+                elif prev_rc == 0 and rc > 0:
+                    self.error_detected.emit("green",
+                        f"Recover,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{port_label}: Output connected",
+                        self.ip)
 
     def stop(self):
         try:
@@ -407,12 +577,12 @@ class NovastarCoexSocket(QObject):
 
 
 class CoexTrapListener(QThread):
-    """Luistert op UDP poort 162 voor SNMP traps van COEX processors.
-    Eén instance voor de hele applicatie (poort 162 kan maar 1x gebonden worden).
+    """Luistert op UDP poort voor SNMP traps van COEX processors.
+    Eén instance voor de hele applicatie (poort kan maar 1x gebonden worden).
     """
     trap_received = Signal(str, str, str)  # color, message, source_ip
 
-    def __init__(self, port=162, parent=None):
+    def __init__(self, port=COEX_TRAP_PORT, parent=None):
         super().__init__(parent)
         self.port = port
         self.running = True
@@ -445,10 +615,28 @@ class CoexTrapListener(QThread):
                         src_ip = transportInfo[1][0]
                 except Exception:
                     pass
-                msgs = []
+
+                readable = None
+                raw_msgs = []
                 for oid, val in varBinds:
-                    msgs.append(f"{oid.prettyPrint()}={val.prettyPrint()}")
-                self.trap_received.emit("red", "TRAP: " + " | ".join(msgs), src_ip)
+                    v = val.prettyPrint()
+                    raw_msgs.append(f"{oid.prettyPrint()}={v}")
+                    # Gebruik letterlijk processor-event als die als CSV-achtige tekst in de trap zit.
+                    if v.count(",") >= 6 and (",Error," in v or ",Warning," in v or ",Recover," in v):
+                        readable = v
+
+                if readable:
+                    if ",Error," in readable:
+                        color = "red"
+                    elif ",Warning," in readable:
+                        color = "orange"
+                    elif ",Recover," in readable or ",Info," in readable:
+                        color = "green"
+                    else:
+                        color = "gray"
+                    self.trap_received.emit(color, readable, src_ip)
+                else:
+                    self.trap_received.emit("gray", "TRAP_RAW: " + " | ".join(raw_msgs), src_ip)
 
             ntfrcv.NotificationReceiver(snmpEngine, cbFun)
             snmpEngine.transportDispatcher.jobStarted(1)
@@ -505,7 +693,11 @@ class MonitorWorker(QThread):
                 if not self.running: break
                 ip = proc.get("ip")
                 name = proc.get("name", "Device")
+                ptype = proc.get("type", "").lower()
                 if not ip: continue
+                # COEX en andere SNMP-gebaseerde devices worden niet via HTTP gemonitord
+                if "coex" in ptype or "novastar" in ptype or "mx" in ptype:
+                    continue
                 try:
                     url = f"http://{ip}/health/alerts"
                     resp = requests.get(url, timeout=1.0)
@@ -655,32 +847,131 @@ class ScanWorker(QThread):
 
         ips_to_scan = []
         scanned_subnets = []
+        primary_ip = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            primary_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+
+        # Scan ALLE subnets van alle netwerk-interfaces, niet alleen de internet-facing route.
+        # Dit is nodig als de COEX op een ander subnet zit dan de internet-connectie.
         for local_ip in valid_ips:
             base = ".".join(local_ip.split('.')[:-1])
-            if base in scanned_subnets: continue
+            if base in scanned_subnets:
+                continue
             scanned_subnets.append(base)
-            for i in range(1, 255): ips_to_scan.append(f"{base}.{i}")
+            for i in range(1, 255):
+                ips_to_scan.append(f"{base}.{i}")
 
-        total = len(ips_to_scan)
+        subnets_str = ", ".join(f"{b}.0/24" for b in scanned_subnets)
+        self.log_signal.emit(f"Scanning: {subnets_str}")
+
+        total = max(len(ips_to_scan), 1)
         found_count = 0
-        
+        found_ips = set()
+
+        # FASE 1: HTTP scan (snel, parallel) — alleen Helios
         with ThreadPoolExecutor(max_workers=50) as executor:
-            results = list(executor.map(self.check_ip, ips_to_scan))
+            results = list(executor.map(self.check_ip_http, ips_to_scan))
             for i, result in enumerate(results):
-                self.progress_signal.emit(int((i/total)*100))
+                self.progress_signal.emit(int((i/total)*50))  # tot 50%
                 if result:
                     self.found_signal.emit(result[0], result[1], result[2])
+                    found_ips.add(result[0])
                     found_count += 1
-        
+
+        # FASE 2: SNMP scan (parallel, licht) — voor IPs die niet via HTTP gevonden zijn
+        self.log_signal.emit("SNMP scan voor Novastar COEX...")
+        snmp_engine = self._make_snmp_engine()
+        if snmp_engine is not None:
+            remaining = [ip for ip in ips_to_scan if ip not in found_ips]
+            if remaining:
+                with ThreadPoolExecutor(max_workers=64) as executor:
+                    results = list(executor.map(lambda ip: self.check_ip_snmp(ip, snmp_engine), remaining))
+                    for i, result in enumerate(results):
+                        self.progress_signal.emit(50 + int((i/max(len(remaining),1))*50))
+                        if result:
+                            self.found_signal.emit(result[0], result[1], result[2])
+                            found_count += 1
+
         self.finished_signal.emit(found_count)
 
-    def check_ip(self, ip):
+    def _make_snmp_engine(self):
+        """Probeer pysnmp imports; return dict met api refs of None."""
+        try:
+            import asyncio
+            from pysnmp.hlapi.asyncio import (SnmpEngine, CommunityData, UdpTransportTarget,
+                                              ContextData, ObjectType, ObjectIdentity, getCmd)
+            return {
+                "asyncio": asyncio, "SnmpEngine": SnmpEngine, "CommunityData": CommunityData,
+                "UdpTransportTarget": UdpTransportTarget, "ContextData": ContextData,
+                "ObjectType": ObjectType, "ObjectIdentity": ObjectIdentity, "getCmd": getCmd
+            }
+        except ImportError:
+            return None
+
+    def check_ip_http(self, ip):
         try: 
             if requests.get(f"http://{ip}/health/alerts", timeout=0.8).status_code==200:
                 name = self.fetch_processor_name(ip)
                 return (ip, "Helios", name)
         except: pass
         return None
+
+    def check_ip_snmp(self, ip, S, timeout=0.15):
+        """Snelle SNMP probe op ctrl_model OID. S = engine dict van _make_snmp_engine()."""
+        asyncio = S["asyncio"]
+        try:
+            async def _do():
+                target = S["UdpTransportTarget"]((ip, 161), timeout=timeout, retries=0)
+                errInd, errStat, errIdx, varBinds = await S["getCmd"](
+                    S["SnmpEngine"](), S["CommunityData"]("public", mpModel=1),
+                    target, S["ContextData"](),
+                    S["ObjectType"](S["ObjectIdentity"]("1.3.6.1.4.1.319.10.10.1.2"))
+                )
+                if errInd or errStat:
+                    return None
+                for vb in varBinds:
+                    return vb[1].prettyPrint()
+                return None
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                model = loop.run_until_complete(_do())
+            finally:
+                # Cancel pending pysnmp dispatcher tasks om 'Task was destroyed' warnings te vermijden
+                try:
+                    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    try:
+                        loop.run_until_complete(loop.shutdown_asyncgens())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                loop.close()
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+            if not model:
+                return None
+            mu = model.upper()
+            if any(mu.startswith(p) for p in ("MX", "CX", "KU", "VX")):
+                return (ip, "Novastar_COEX", model)
+        except Exception:
+            return None
+        return None
+
+    def check_ip(self, ip):
+        # Backwards compat — niet meer gebruikt door run()
+        return self.check_ip_http(ip)
 
     def fetch_processor_name(self, ip):
         try:
@@ -921,18 +1212,27 @@ class SettingsDialog(QDialog):
 
     def on_found(self, ip, ptype, detected_name):
         detected_name = (detected_name or "").strip()
-        fallback_name = f"Helios-{ip.split('.')[-1]}"
+        prefix_map = {"Helios": "Helios", "Novastar_COEX": "COEX", "BROMPTON": "BR", "COLORLIGHT": "CL"}
+        prefix = prefix_map.get(ptype, "DEV")
+        fallback_name = f"{prefix}-{ip.split('.')[-1]}"
 
         existing = next((p for p in self.processors if p.get('ip') == ip), None)
         if existing:
             current_name = str(existing.get('name', '')).strip()
-            if detected_name and (not current_name or current_name.startswith("Helios-")):
+            generic_prefixes = ("Helios-", "COEX-", "BR-", "CL-", "DEV-")
+            if detected_name and (not current_name or current_name.startswith(generic_prefixes)):
                 existing['name'] = detected_name
-                self.refresh_list()
+            # Update type als die nog niet juist was
+            if existing.get('type') != ptype and ptype != "Helios":
+                existing['type'] = ptype
+            self.refresh_list()
             return
 
         name = detected_name or fallback_name
-        self.processors.append({"name": name, "ip": ip, "type": ptype})
+        entry = {"name": name, "ip": ip, "type": ptype}
+        if ptype == "Novastar_COEX":
+            entry["snmp_community"] = "public"
+        self.processors.append(entry)
         self.refresh_list()
 
     def on_scan_finished(self, count):
@@ -1166,7 +1466,7 @@ class LEDLoggerApp(QMainWindow):
             has_coex = any("coex" in p.get("type", "").lower() or "novastar" in p.get("type", "").lower()
                            for p in self.processors)
             if has_coex:
-                self.trap_listener = CoexTrapListener(port=162)
+                self.trap_listener = CoexTrapListener(port=COEX_TRAP_PORT)
                 self.trap_listener.trap_received.connect(self.on_trap_received)
                 self.trap_listener.start()
 
@@ -1213,7 +1513,24 @@ class LEDLoggerApp(QMainWindow):
 
     @Slot(str, str, str)
     def on_socket_error(self, color, msg, ip):
-        if ip in self.processor_widgets: self.processor_widgets[ip].force_error()
+        if ip in self.processor_widgets:
+            if color == "green":
+                self.processor_widgets[ip].set_status("ok", force=True)
+            elif color == "orange":
+                # Warning: niet rood maken, maar wel uit "offline" halen
+                if self.processor_widgets[ip].status not in ("error",):
+                    self.processor_widgets[ip].set_status("ok", force=True)
+            elif color == "gray":
+                # Informatieve melding, status niet aanpassen
+                pass
+            else:
+                self.processor_widgets[ip].force_error()
+        # Update webserver status
+        if ip in LogWebServer.device_statuses:
+            if color == "green":
+                LogWebServer.device_statuses[ip] = "ok"
+            elif color == "red":
+                LogWebServer.device_statuses[ip] = "error"
         self.add_log_entry(color, msg, ip)
 
     @Slot(str, str, str, str)
