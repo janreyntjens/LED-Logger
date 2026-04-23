@@ -1,0 +1,14 @@
+{
+    "processors": [
+        {
+            "name": "Processor 1",
+            "ip": "192.168.1.10",
+            "type": "Helios"
+        },
+        {
+            "name": "Processor 2",
+            "ip": "192.168.1.11",
+            "type": "Helios"
+        }
+    ]
+}

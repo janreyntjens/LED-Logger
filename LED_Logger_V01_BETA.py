@@ -1,0 +1,1120 @@
+import sys
+import os
+import time
+import json
+import socket
+import traceback
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+
+# --- VEILIGE IMPORT ---
+# --- GEKORRIGEERDE IMPORT (Regel 16 t/m 25) ---
+try:
+    import requests
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+        QFrame, QLabel, QPushButton, QTextEdit, QMessageBox, QDialog,
+        QLineEdit, QListWidget, QListWidgetItem, QProgressBar, QSizePolicy, 
+        QComboBox, QScrollArea, QTabWidget, QTreeWidget, QTreeWidgetItem, 
+        QHeaderView, QSplitter, QTableWidget, QTableWidgetItem, QCheckBox
+    )
+    from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QUrl, QObject
+    from PySide6.QtGui import QPalette, QColor, QIcon, QFont
+    from PySide6.QtWebSockets import QWebSocket
+    from PySide6.QtNetwork import QAbstractSocket 
+except ImportError as e:
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(0, f"Error: {e}\nRun: pip install PySide6 requests", "Startup Error", 0x10)
+    sys.exit(1)
+
+# --- CONSTANTEN ---
+APP_NAME = "LED Logger"
+VERSION = "V01_BETA"
+LOGO_FILE = "logo.ico"  # <--- HIER ZAT DE FOUT (ontbrekend aanhalingsteken)
+CONFIG_FILE = "config.json"
+HISTORY_FILE = "history.json"
+
+def save_config(data):
+    """Slaat de configuratie op naar config.json."""
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"Save error: {e}")
+
+def load_json(file, default):
+    if not os.path.exists(file): return default
+    try:
+        with open(file, 'r') as f: return json.load(f)
+    except: return default
+
+def save_json(file, data):
+    try:
+        with open(file, 'w') as f: json.dump(data, f, indent=4)
+    except: pass
+
+# ==========================================
+#       MODULES
+# ==========================================
+
+class LogWebServer(BaseHTTPRequestHandler):
+    log_data = []  
+    device_statuses = {}  # Nieuw: houdt status per IP bij
+    last_clear_time = 0  # Track wanneer laatste clear was
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        
+        # Bereken statistieken
+        total = len(self.device_statuses)
+        online = sum(1 for s in self.device_statuses.values() if s in ["ok", "error"])
+        status_color = "#2ecc71" if online == total and total > 0 else "#f1c40f" if online > 0 else "#e74c3c"
+        
+        # Snellere refresh direct na een clear
+        refresh_interval = 2 if (time.time() - self.last_clear_time) < 10 else 5
+
+        html = f"""
+        <html>
+        <head>
+            <title>{APP_NAME} Remote Monitor</title>
+            <meta http-equiv="refresh" content="{refresh_interval}">
+            <style>
+                body {{ background-color: #0f0f0f; color: #ececec; font-family: 'Segoe UI', sans-serif; padding: 30px; margin: 0; }}
+                
+                /* Custom Dark Scrollbar */
+                ::-webkit-scrollbar {{ width: 12px; }}
+                ::-webkit-scrollbar-track {{ background: #1a1a1a; }}
+                ::-webkit-scrollbar-thumb {{ background: #333; border-radius: 6px; border: 3px solid #1a1a1a; }}
+
+                .header {{ 
+                    display: flex; 
+                    justify-content: space-between; 
+                    align-items: center; 
+                    border-bottom: 2px solid #2a82da; 
+                    padding-bottom: 15px; 
+                    margin-bottom: 20px;
+                }}
+
+                h2 {{ color: #2a82da; margin: 0; letter-spacing: 1px; }}
+
+                /* Status Indicator Style */
+                .status-bar {{
+                    background: #181818;
+                    padding: 10px 20px;
+                    border-radius: 20px;
+                    border: 1px solid #333;
+                    font-weight: bold;
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }}
+                .dot {{ height: 12px; width: 12px; background-color: {status_color}; border-radius: 50%; display: inline-block; }}
+
+                .entry {{ padding: 8px 12px; background: #181818; border-radius: 4px; margin-bottom: 4px; border-left: 4px solid #333; font-family: 'Consolas', monospace; }}
+                .time {{ color: #666; font-size: 12px; margin-right: 10px; }}
+                .red {{ border-left-color: #e74c3c; color: #ff6b6b; font-weight: bold; }}
+                .green {{ border-left-color: #2ecc71; color: #2ecc71; }}
+                .system {{ border-left-color: #2a82da; color: #2a82da; font-style: italic; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>{APP_NAME} Live LOG</h2>
+                <div class="status-bar">
+                    <span class="dot"></span>
+                    SYSTEM ONLINE: {online} / {total} DEVICES
+                </div>
+            </div>
+            <div id="logs">
+        """
+        for entry in reversed(self.log_data[-100:]):
+            color_class = "system" if entry.get("ip") == "SYSTEM" else entry.get("color", "gray")
+            html += f'<div class="entry {color_class}"><span class="time">[{entry["time"]}]</span> {entry["msg"]}</div>'
+            
+        html += "</div></body></html>"
+        self.wfile.write(html.encode("utf-8"))
+
+def severity_to_color(severity):
+    """Map Helios severity levels to log colors."""
+    sev = str(severity).lower().strip() if severity else ""
+    
+    # Debug: log what we receive
+    # print(f"DEBUG: severity='{severity}' -> '{sev}'")
+    
+    # 'none' means alert cleared/resolved
+    if sev in ["", "none", "null"]: 
+        return "gray"
+    
+    # Helios severity mapping
+    if sev in ["critical"]: 
+        return "red"
+    if sev in ["warning", "error"]: 
+        return "orange"
+    if sev in ["info", "notice"]: 
+        return "green"
+    
+    # Unknown severity
+    return "gray"
+
+class HeliosSocket(QObject):
+    error_detected = Signal(str, str, str)
+
+    def __init__(self, ip, name, parent=None):
+        super().__init__(parent)
+        self.ip = ip.strip()
+        self.name = name
+        self.active_errors = set()
+        
+        self.ws = QWebSocket()
+        self.url = f"ws://{self.ip}/api/v1/data/rpc/websocket"
+        self.ws.textMessageReceived.connect(self.on_message)
+        
+        self.retry_timer = QTimer(self)
+        self.retry_timer.timeout.connect(self.check_connection)
+        self.retry_timer.start(5000) 
+        self.check_connection()
+
+    def check_connection(self):
+        if self.ws.state() == QAbstractSocket.UnconnectedState:
+            self.ws.open(QUrl(self.url))
+
+    def on_message(self, message):
+        try:
+            data = json.loads(message)
+            params = data.get("params", {})
+            current_message_errors = {}
+
+            if "sys" in params:
+                for k, v in params["sys"].get("alerts", {}).items():
+                    current_message_errors[k] = (self.format_error(k, v), v)
+            if "dev" in params:
+                for k, v in params["dev"].get("ingest", {}).get("alerts", {}).items():
+                    current_message_errors[k] = (self.format_error(k, v), v)
+
+            if current_message_errors:
+                for err_id, (msg, raw_data) in current_message_errors.items():
+                    if err_id not in self.active_errors:
+                        severity = raw_data.get("severity", "error") if isinstance(raw_data, dict) else "error"
+                        color = severity_to_color(severity)
+                        self.error_detected.emit(color, f"{self.name}: {msg}", self.ip)
+                        self.active_errors.add(err_id)
+            
+            if "sys" in params or "dev" in params:
+                for old_err in list(self.active_errors):
+                    if old_err not in current_message_errors:
+                        self.active_errors.remove(old_err)
+        except: pass
+
+    def format_error(self, key, val):
+        parts = [f"[{key}]"]
+        if isinstance(val, dict):
+            brief = str(val.get("brief", "")).strip()
+            desc = str(val.get("desc", "")).strip()
+            if brief: parts.append(brief)
+            if desc and desc != brief: parts.append(f"| {desc}")
+        else:
+            parts.append(str(val))
+        return " ".join(parts)
+
+    def stop(self):
+        self.retry_timer.stop()
+        self.ws.close()
+
+class MonitorWorker(QThread):
+    status_signal = Signal(str, str)
+    alert_signal = Signal(str, str, str, dict)  # ip, color, message, receiver_info
+
+    def __init__(self, processors):
+        super().__init__()
+        self.processors = processors
+        self.running = True
+        self.last_alerts = {}  # Track alerts per device
+        self.force_scan_flag = False  # Trigger immediate scan
+
+    def update_processors(self, new_list):
+        self.processors = new_list
+        self.force_scan_flag = True  # Trigger immediate scan
+
+    def force_scan(self):
+        """Request immediate scan on next loop iteration."""
+        self.force_scan_flag = True
+
+    def run(self):
+        while self.running:
+            if not self.processors:
+                time.sleep(2)
+                continue
+            
+            for proc in self.processors:
+                if not self.running: break
+                ip = proc.get("ip")
+                name = proc.get("name", "Device")
+                if not ip: continue
+                try:
+                    url = f"http://{ip}/health/alerts"
+                    resp = requests.get(url, timeout=1.0)
+                    
+                    if resp.status_code == 200:
+                        self.status_signal.emit(ip, "ok")  # Device is reachable!
+                        try:
+                            alerts = resp.json()
+                            self._process_alerts(ip, name, alerts)
+                        except Exception as e:
+                            # JSON parsing failed, but device is still reachable
+                            pass
+
+                        try:
+                            sys_resp = requests.get(f"http://{ip}/api/v1/public?sys.alerts", timeout=1.0)
+                            if sys_resp.status_code == 200:
+                                self._process_sys_alerts(ip, name, sys_resp.json())
+                        except Exception:
+                            pass
+                    else:
+                        self.status_signal.emit(ip, "error")
+                except:
+                    self.status_signal.emit(ip, "offline")
+            
+            time.sleep(3)
+
+    def _process_alerts(self, ip, name, alerts_data):
+        """Parse health/alerts JSON and emit new alerts."""
+        current_alert_ids = set()
+        alert_store_key = f"{ip}:health"
+        
+        # Parse alerts from the response
+        if isinstance(alerts_data, dict):
+            for severity_level, alert_list in alerts_data.items():
+                if isinstance(alert_list, list):
+                    for alert in alert_list:
+                        if isinstance(alert, dict):
+                            alert_id = alert.get("id", str(hash(str(alert))))
+                            current_alert_ids.add(alert_id)
+                            
+                            # Check if this is a new alert
+                            if alert_store_key not in self.last_alerts or alert_id not in self.last_alerts[alert_store_key]:
+                                msg = alert.get("message", alert.get("desc", str(alert)))
+                                color = severity_to_color(severity_level)
+                                self.alert_signal.emit(ip, color, f"{name}: {msg}", "")
+        
+        # Store this alert set for next iteration
+        if alert_store_key not in self.last_alerts:
+            self.last_alerts[alert_store_key] = set()
+        self.last_alerts[alert_store_key] = current_alert_ids
+
+    def _severity_number_to_color(self, severity):
+        try:
+            sev = int(severity)
+        except:
+            return "gray"
+        if sev in [2, 3]:
+            return "red"
+        if sev == 4:
+            return "orange"
+        if sev == 5:
+            return "green"
+        return "gray"
+
+    def _process_sys_alerts(self, ip, name, sys_alerts_payload):
+        """Parse sys.alerts payload and emit receiver-aware alerts with MAC addresses."""
+        current_alert_ids = set()
+        alert_store_key = f"{ip}:sys"
+
+        if not isinstance(sys_alerts_payload, dict):
+            return
+
+        sys_obj = sys_alerts_payload.get("sys", {}) if isinstance(sys_alerts_payload.get("sys", {}), dict) else {}
+        alerts_obj = sys_obj.get("alerts", {}) if isinstance(sys_obj.get("alerts", {}), dict) else {}
+
+        for alert_key, alert_data in alerts_obj.items():
+            if not isinstance(alert_data, dict):
+                continue
+
+            brief = str(alert_data.get("brief", "")).strip()
+            desc = str(alert_data.get("desc", "")).strip()
+            msg = brief or desc or str(alert_key)
+            color = self._severity_number_to_color(alert_data.get("severity"))
+
+            devices = alert_data.get("devices", {}) if isinstance(alert_data.get("devices", {}), dict) else {}
+            receivers = devices.get("receivers", {}) if isinstance(devices.get("receivers", {}), dict) else {}
+
+            if receivers:
+                for receiver_mac, receiver_details in receivers.items():
+                    # Parse receiver details (SFP, output, chain position, etc.)
+                    receiver_info = {
+                        "mac": str(receiver_mac),
+                        "sfp": "",
+                        "output": "",
+                        "chain_pos": ""
+                    }
+                    
+                    if isinstance(receiver_details, dict):
+                        # Debug print om te zien welke velden beschikbaar zijn
+                        print(f"[DEBUG] Receiver {receiver_mac} details: {receiver_details}")
+                        
+                        # Probeer verschillende veldnamen die Helios zou kunnen gebruiken
+                        receiver_info["sfp"] = str(receiver_details.get("sfp", receiver_details.get("port", "")))
+                        receiver_info["output"] = str(receiver_details.get("output", receiver_details.get("switch", "")))
+                        receiver_info["chain_pos"] = str(receiver_details.get("chain", receiver_details.get("position", receiver_details.get("index", ""))))
+                    
+                    alert_id = f"{alert_key}:{receiver_mac}:{msg}"
+                    current_alert_ids.add(alert_id)
+                    if alert_store_key not in self.last_alerts or alert_id not in self.last_alerts[alert_store_key]:
+                        self.alert_signal.emit(ip, color, f"{name}: [{alert_key}] {msg}", receiver_info)
+            else:
+                alert_id = f"{alert_key}:{msg}"
+                current_alert_ids.add(alert_id)
+                if alert_store_key not in self.last_alerts or alert_id not in self.last_alerts[alert_store_key]:
+                    self.alert_signal.emit(ip, color, f"{name}: [{alert_key}] {msg}", {})
+
+        self.last_alerts[alert_store_key] = current_alert_ids
+    
+    def stop(self):
+        self.running = False
+        self.wait()
+
+class ScanWorker(QThread):
+    progress_signal = Signal(int)
+    found_signal = Signal(str, str, str)
+    log_signal = Signal(str)
+    finished_signal = Signal(int)
+
+    def run(self):
+        self.log_signal.emit("Netwerk scannen...")
+        all_ips = set()
+        try:
+            host = socket.gethostname()
+            _, _, ip_list = socket.gethostbyname_ex(host)
+            for ip in ip_list: all_ips.add(ip)
+        except: pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80)); all_ips.add(s.getsockname()[0]); s.close()
+        except: pass
+
+        valid_ips = [ip for ip in all_ips if not ip.startswith("127.") and ":" not in ip]
+        if not valid_ips:
+            self.log_signal.emit("Geen netwerk gevonden!")
+            self.finished_signal.emit(0)
+            return
+
+        ips_to_scan = []
+        scanned_subnets = []
+        for local_ip in valid_ips:
+            base = ".".join(local_ip.split('.')[:-1])
+            if base in scanned_subnets: continue
+            scanned_subnets.append(base)
+            for i in range(1, 255): ips_to_scan.append(f"{base}.{i}")
+
+        total = len(ips_to_scan)
+        found_count = 0
+        
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            results = list(executor.map(self.check_ip, ips_to_scan))
+            for i, result in enumerate(results):
+                self.progress_signal.emit(int((i/total)*100))
+                if result:
+                    self.found_signal.emit(result[0], result[1], result[2])
+                    found_count += 1
+        
+        self.finished_signal.emit(found_count)
+
+    def check_ip(self, ip):
+        try: 
+            if requests.get(f"http://{ip}/health/alerts", timeout=0.8).status_code==200:
+                name = self.fetch_processor_name(ip)
+                return (ip, "Helios", name)
+        except: pass
+        return None
+
+    def fetch_processor_name(self, ip):
+        try:
+            resp = requests.get(f"http://{ip}/api/v1/public?sys.description", timeout=0.8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and "sys" in data:
+                    name = data["sys"].get("description", "")
+                    name = self.clean_candidate(name)
+                    if name:
+                        return name
+        except:
+            pass
+
+        try:
+            host_name = socket.gethostbyaddr(ip)[0]
+            host_name = self.clean_candidate(host_name)
+            if host_name:
+                return host_name
+        except:
+            pass
+
+        return ""
+
+    def extract_name_from_payload(self, payload):
+        """Not used anymore, kept for compatibility"""
+        return ""
+
+    def clean_candidate(self, value):
+        if not isinstance(value, str):
+            return ""
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        if len(cleaned) > 100:
+            return ""
+        return cleaned
+
+# --- GUI CLASSES ---
+
+class ProcessorCard(QFrame):
+    clicked = Signal(str)
+    def __init__(self, name, ip, ptype):
+        super().__init__()
+        self.ip = ip; self.name = name; self.ptype = ptype; self.status = "offline"; self.is_selected = False; self.is_highlighted = False
+        self.setObjectName("ProcCard"); self.setFixedHeight(85); self.setCursor(Qt.PointingHandCursor)
+        self.outer_layout = QVBoxLayout(self); self.outer_layout.setContentsMargins(2, 2, 2, 2); self.outer_layout.setSpacing(0)
+        self.inner_frame = QFrame(); self.inner_frame.setObjectName("InnerCard")
+        self.inner_layout = QVBoxLayout(self.inner_frame); self.inner_layout.setContentsMargins(15, 8, 10, 8); self.inner_layout.setSpacing(2)
+        top = QHBoxLayout()
+        n = QLabel(str(name)); n.setFont(QFont("Segoe UI", 11, QFont.Bold)); n.setStyleSheet("border:none; background:transparent; color:#fff;")
+        t = QLabel(str(ptype).upper()); t.setFont(QFont("Segoe UI", 8, QFont.Bold)); t.setStyleSheet("border:none; color:#2a82da; background:#111; padding:2px 6px; border-radius:3px;")
+        top.addWidget(n); top.addStretch(); top.addWidget(t); self.inner_layout.addLayout(top)
+        i = QLabel(str(ip)); i.setFont(QFont("Consolas", 9)); i.setStyleSheet("border:none; background:transparent; color:#888;"); self.inner_layout.addWidget(i)
+        self.outer_layout.addWidget(self.inner_frame); self.update_style()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton: self.clicked.emit(self.ip)
+        super().mousePressEvent(e)
+
+    def set_status(self, s, force=False): 
+        if not force and self.status == "error" and s == "ok": return
+        self.status = s; self.update_style()
+
+    def force_error(self): self.status = "error"; self.update_style()
+    def set_selected(self, s): self.is_selected = s; self.update_style()
+    def set_highlighted(self, highlighted):
+        self.is_highlighted = highlighted
+        self.update_style()
+    def update_style(self):
+        c = "#444"
+        if self.status == "ok": c = "#2ecc71"
+        elif self.status == "error": c = "#e74c3c"
+        b = "2px solid #2a82da" if self.is_selected else "2px solid transparent"
+        if self.is_highlighted:
+            bg = "#0a3a6a"
+            border = "3px solid #2a82da"
+        else:
+            bg = "#1e1e1e"
+            border = f"5px solid {c}"
+        self.setStyleSheet(f"#ProcCard {{ border: {b}; background: transparent; border-radius: 6px; }}")
+        self.inner_frame.setStyleSheet(f"#InnerCard {{ background: {bg}; border-left: {border}; border-radius: 3px; }}")
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None, current_processors=[]):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Processors")
+        self.resize(950, 600)
+        self.processors = list(current_processors)
+        self.edit_index = -1 
+        
+        self.setStyleSheet("QDialog { background-color: #121212; } QLabel { color: #eaeaea; font-family: 'Segoe UI'; } QLineEdit, QComboBox { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; padding: 10px; color: #fff; } QListWidget { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; color: #ddd; } QPushButton { background-color: #333; color: white; border-radius: 5px; padding: 10px; border: none; } QProgressBar { border: none; background-color: #111; height: 4px; } QProgressBar::chunk { background-color: #2a82da; }")
+        
+        main = QVBoxLayout(self)
+        main.setContentsMargins(30,30,30,30)
+        main.setSpacing(25)
+        
+        main.addWidget(QLabel("DEVICE MANAGEMENT", styleSheet="font-size: 18px; font-weight: bold; color: #fff;"))
+        
+        split = QHBoxLayout()
+        split.setSpacing(30)
+        
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Active Devices", styleSheet="font-weight: bold; color: #aaa;"))
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        self.list_widget.itemClicked.connect(self.on_item_clicked)
+        self.refresh_list()
+        left.addWidget(self.list_widget)
+        
+        btn_del = QPushButton("Remove Selected")
+        btn_del.setAutoDefault(False)
+        btn_del.setDefault(False)
+        btn_del.setStyleSheet("background-color: #2c0b0b; color: #ff5555;")
+        btn_del.clicked.connect(self.remove_processor)
+        left.addWidget(btn_del)
+        
+        split.addLayout(left, 45)
+        
+        right = QVBoxLayout()
+        right.setSpacing(15)
+        self.lbl_action = QLabel("Add New Device", styleSheet="font-weight: bold; color: #aaa;")
+        right.addWidget(self.lbl_action)
+        self.inp_name = QLineEdit(); self.inp_name.setPlaceholderText("Name")
+        self.inp_ip = QLineEdit(); self.inp_ip.setPlaceholderText("IP Address")
+        self.inp_type = QComboBox(); self.inp_type.addItems(["HELIOS", "COEX", "BROMPTON", "COLORLIGHT"])
+        
+        right.addWidget(QLabel("Name:"))
+        right.addWidget(self.inp_name)
+        right.addWidget(QLabel("IP:"))
+        right.addWidget(self.inp_ip)
+        right.addWidget(QLabel("Type:"))
+        right.addWidget(self.inp_type)
+        
+        btn_row = QHBoxLayout()
+        self.btn_save = QPushButton("ADD DEVICE")
+        self.btn_save.setAutoDefault(True)
+        self.btn_save.setDefault(True)
+        self.btn_save.setStyleSheet("background-color: #27ae60;")
+        self.btn_save.clicked.connect(self.save_device)
+        
+        self.btn_cancel = QPushButton("Cancel Edit")
+        self.btn_cancel.setAutoDefault(False)
+        self.btn_cancel.setDefault(False)
+        self.btn_cancel.setStyleSheet("background-color: #444; color: #aaa;")
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.clicked.connect(self.cancel_edit)
+        
+        btn_row.addWidget(self.btn_save)
+        btn_row.addWidget(self.btn_cancel)
+        right.addLayout(btn_row)
+        
+        line = QFrame(); line.setFrameShape(QFrame.HLine); line.setStyleSheet("color: #333;")
+        right.addWidget(line)
+        right.addWidget(QLabel("Pro Scanner", styleSheet="font-weight: bold; color: #aaa; margin-top: 10px;"))
+        
+        sl = QHBoxLayout()
+        self.btn_scan = QPushButton("SCAN NETWORK")
+        self.btn_scan.setAutoDefault(False)
+        self.btn_scan.setStyleSheet("background-color: #2a82da;")
+        self.btn_scan.clicked.connect(self.start_scan)
+        sl.addWidget(self.btn_scan)
+        self.progress = QProgressBar(); self.progress.setTextVisible(False)
+        sl.addWidget(self.progress)
+        right.addLayout(sl)
+        
+        self.scan_lbl = QLabel("Ready."); self.scan_lbl.setStyleSheet("color: #666; font-style: italic;")
+        right.addWidget(self.scan_lbl)
+        right.addStretch()
+        split.addLayout(right, 55)
+        main.addLayout(split)
+        
+        footer = QHBoxLayout(); footer.addStretch()
+        btn_close = QPushButton("SAVE & CLOSE")
+        btn_close.setAutoDefault(False)
+        btn_close.setFixedSize(180, 50)
+        btn_close.clicked.connect(self.accept)
+        footer.addWidget(btn_close)
+        main.addLayout(footer)
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        for p in self.processors:
+            self.list_widget.addItem(f"{p.get('name')} | {p.get('type')} | {p.get('ip')}")
+
+    def on_item_clicked(self, item):
+        row = self.list_widget.row(item)
+        data = self.processors[row]
+        self.inp_name.setText(data.get("name", ""))
+        self.inp_ip.setText(data.get("ip", ""))
+        self.inp_type.setCurrentText(data.get("type", "Helios"))
+        self.edit_index = row
+        self.lbl_action.setText("Edit Device")
+        self.btn_save.setText("UPDATE DEVICE")
+        self.btn_save.setStyleSheet("background-color: #2a82da;")
+        self.btn_cancel.setVisible(True)
+
+    def cancel_edit(self):
+        self.edit_index = -1
+        self.inp_name.clear()
+        self.inp_ip.clear()
+        self.lbl_action.setText("Add New Device")
+        self.btn_save.setText("ADD DEVICE")
+        self.btn_save.setStyleSheet("background-color: #27ae60;")
+        self.btn_cancel.setVisible(False)
+        self.list_widget.clearSelection()
+
+    def save_device(self):
+        name = self.inp_name.text()
+        ip = self.inp_ip.text()
+        ptype = self.inp_type.currentText()
+        if not name or not ip: return
+        new_data = {"name": name, "ip": ip, "type": ptype}
+        if self.edit_index >= 0: self.processors[self.edit_index] = new_data
+        else: self.processors.append(new_data)
+        self.refresh_list()
+        self.cancel_edit()
+
+    def remove_processor(self):
+        selected_rows = sorted([self.list_widget.row(item) for item in self.list_widget.selectedItems()], reverse=True)
+        if not selected_rows:
+            return
+        for row in selected_rows:
+            if row >= 0:
+                del self.processors[row]
+        self.refresh_list()
+        self.cancel_edit()
+
+    def start_scan(self):
+        self.btn_scan.setEnabled(False); self.btn_scan.setText("SCANNING...")
+        self.scan_lbl.setText("Scanning subnets...")
+        self.scanner = ScanWorker()
+        self.scanner.progress_signal.connect(self.progress.setValue)
+        self.scanner.found_signal.connect(self.on_found)
+        self.scanner.log_signal.connect(self.scan_lbl.setText)
+        self.scanner.finished_signal.connect(self.on_scan_finished)
+        self.scanner.start()
+
+    def on_found(self, ip, ptype, detected_name):
+        detected_name = (detected_name or "").strip()
+        fallback_name = f"Helios-{ip.split('.')[-1]}"
+
+        existing = next((p for p in self.processors if p.get('ip') == ip), None)
+        if existing:
+            current_name = str(existing.get('name', '')).strip()
+            if detected_name and (not current_name or current_name.startswith("Helios-")):
+                existing['name'] = detected_name
+                self.refresh_list()
+            return
+
+        name = detected_name or fallback_name
+        self.processors.append({"name": name, "ip": ip, "type": ptype})
+        self.refresh_list()
+
+    def on_scan_finished(self, count):
+        self.btn_scan.setEnabled(True)
+        self.btn_scan.setText("SCAN NETWORK")
+        self.progress.setValue(0)
+        self.scan_lbl.setText(f"Found {count} devices.")
+
+    def get_processors(self):
+        return self.processors
+
+# --- MAIN APP ---
+
+class LEDLoggerApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.config = load_json(CONFIG_FILE, {"processors": []})
+        self.history_data = load_json(HISTORY_FILE, [])
+        self.processors = self.config["processors"]
+        self.processor_widgets = {}; self.sockets = {}; self.selected_ip = None; self.log_history = []
+        
+        # Basis UI setup
+        self.setup_ui()
+        
+        # Initialiseer data voor webserver
+        LogWebServer.log_data = self.log_history
+        LogWebServer.device_statuses = {p['ip']: "offline" for p in self.processors if 'ip' in p}
+        
+        # --- WEB SERVER SETUP (Main Thread safe) ---
+        port = 8090
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            url = f"http://{local_ip}:{port}"
+        except:
+            url = f"http://localhost:{port}"
+
+        # Update de GUI (Titel en Log) direct vanuit de Main Thread
+        self.setWindowTitle(f"{APP_NAME} - {VERSION} | Remote Log: {url}")
+        self.set_remote_monitor_url(url)
+        self.add_log_entry("green", f"REMOTE MONITOR ACTIVE: {url}", "SYSTEM")
+        
+        # Start nu de server thread zonder dat deze GUI-acties hoeft te doen
+        self.web_thread = threading.Thread(target=self.run_web_server, daemon=True)
+        self.web_thread.start()
+        # -------------------------------------------
+
+        self.http_worker = MonitorWorker(self.processors)
+        self.http_worker.status_signal.connect(self.update_visuals)
+        self.http_worker.alert_signal.connect(self.on_alert_received)
+        QTimer.singleShot(1000, self.http_worker.start)
+        self.init_sockets()
+
+    def run_web_server(self):
+        """Web server draait in aparte thread met error handling."""
+        port = 8090
+        try:
+            print(f"[WEBSERVER] Poging om server te starten op 0.0.0.0:{port}...")
+            server = HTTPServer(("0.0.0.0", port), LogWebServer)
+            print(f"[WEBSERVER] Server succesvol gestart op poort {port}")
+            server.serve_forever()
+        except OSError as e:
+            if e.errno == 10048:  # Windows: Address already in use
+                print(f"[WEBSERVER ERROR] Poort {port} is al in gebruik! Server niet gestart.")
+                print(f"[WEBSERVER] Sluit andere applicaties die poort {port} gebruiken.")
+            else:
+                print(f"[WEBSERVER ERROR] Kan niet binden aan poort {port}: {e}")
+        except Exception as e:
+            print(f"[WEBSERVER ERROR] Onverwachte fout bij starten webserver: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def set_remote_monitor_url(self, url):
+        self.remote_monitor_url = url
+        self.remote_url_label.setText(f'<a href="{url}" style="color:#2a82da; text-decoration: none;">{url}</a>')
+        self.remote_url_label.setToolTip(url)
+        self.btn_copy_remote_url.setEnabled(True)
+
+    def copy_remote_monitor_url(self):
+        if not getattr(self, "remote_monitor_url", ""):
+            return
+        QApplication.clipboard().setText(self.remote_monitor_url)
+        self.add_log_entry("green", "Remote monitor URL copied to clipboard.", "SYSTEM")
+
+    def setup_ui(self):
+        p = QPalette(); p.setColor(QPalette.Window, QColor("#121212")); p.setColor(QPalette.WindowText, QColor("#eaeaea")); p.setColor(QPalette.Base, QColor("#1e1e1e")); p.setColor(QPalette.AlternateBase, QColor("#121212")); p.setColor(QPalette.Text, QColor("#eaeaea")); p.setColor(QPalette.Button, QColor("#1e1e1e")); p.setColor(QPalette.ButtonText, QColor("#eaeaea")); self.setPalette(p)
+        main = QWidget(); self.setCentralWidget(main); layout = QHBoxLayout(main); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0)
+        
+        # Sidebar
+        sidebar = QFrame(); sidebar.setFixedWidth(300); sidebar.setStyleSheet("background: #181818; border-right: 1px solid #2a2a2a;"); s_lay = QVBoxLayout(sidebar); s_lay.setContentsMargins(20,25,20,25)
+        s_lay.addWidget(QLabel(APP_NAME, styleSheet="font-size: 18pt; font-weight: bold; color: #2a82da;")); s_lay.addWidget(QLabel("SYSTEM MONITOR", styleSheet="color: #666; font-size: 10px; letter-spacing: 1px;"))
+
+        remote_row = QHBoxLayout()
+        remote_icon = QLabel("🌐")
+        remote_icon.setStyleSheet("color: #2a82da; font-size: 12px;")
+        remote_row.addWidget(remote_icon)
+
+        self.remote_url_label = QLabel('<a href="#" style="color:#2a82da; text-decoration: none;">Remote log unavailable</a>')
+        self.remote_url_label.setTextFormat(Qt.RichText)
+        self.remote_url_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.remote_url_label.setOpenExternalLinks(True)
+        self.remote_url_label.setStyleSheet("color: #2a82da; font-size: 11px;")
+        remote_row.addWidget(self.remote_url_label, 1)
+
+        self.btn_copy_remote_url = QPushButton("📋")
+        self.btn_copy_remote_url.setCursor(Qt.PointingHandCursor)
+        self.btn_copy_remote_url.setToolTip("Copy remote monitor URL")
+        self.btn_copy_remote_url.setFixedSize(28, 24)
+        self.btn_copy_remote_url.setEnabled(False)
+        self.btn_copy_remote_url.setStyleSheet("QPushButton { background: #252525; border-radius: 5px; } QPushButton:hover { background: #333; }")
+        self.btn_copy_remote_url.clicked.connect(self.copy_remote_monitor_url)
+        remote_row.addWidget(self.btn_copy_remote_url)
+
+        s_lay.addLayout(remote_row)
+        s_lay.addSpacing(18)
+        btn_man = QPushButton("CONFIGURE DEVICES"); btn_man.setCursor(Qt.PointingHandCursor); btn_man.setStyleSheet("QPushButton { background: #252525; color: white; border-radius: 5px; padding: 12px; font-weight: bold; text-align: left; padding-left: 20px;} QPushButton:hover { background: #333; border-left: 2px solid #2a82da; }"); btn_man.clicked.connect(self.open_settings); s_lay.addWidget(btn_man); s_lay.addSpacing(30)
+        
+        # --- Sidebar STATUS OVERVIEW sectie ---
+        s_lay.addWidget(QLabel("STATUS OVERVIEW", styleSheet="color: #555; font-size: 11px; font-weight: bold; margin-bottom: 5px;"))
+        
+        self.device_list = QListWidget()
+        self.device_list.setDragDropMode(QListWidget.InternalMove)
+        self.device_list.setSelectionMode(QListWidget.SingleSelection)
+        self.device_list.setSpacing(2)  # Minimale ruimte tussen kaartjes voor een strakke look
+        
+        # Voorkom horizontale scrollbar en zorg voor strakke aansluiting
+        self.device_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.device_list.setContentsMargins(0, 0, 0, 0)
+        
+        self.device_list.setStyleSheet("""
+            QListWidget { 
+                background: transparent; 
+                border: none; 
+                outline: none;
+            }
+            QListWidget::item { 
+                background: transparent; 
+                padding: 0px; 
+                margin: 0px;
+            }
+        """)
+        
+        self.device_list.model().rowsMoved.connect(self.on_order_changed)
+        s_lay.addWidget(self.device_list)
+        
+        self.rebuild_list()
+        
+        btn_clr = QPushButton("CLEAR LOG / SAVE SESSION"); btn_clr.setCursor(Qt.PointingHandCursor); btn_clr.setStyleSheet("QPushButton { background: #2c0b0b; color: #ff8888; border-radius: 5px; padding: 12px; font-weight: bold; } QPushButton:hover { background: #e74c3c; color: white; }"); btn_clr.clicked.connect(self.clear_log); s_lay.addWidget(btn_clr); layout.addWidget(sidebar)
+        
+        # Tabs
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("QTabWidget::pane { border: 0; } QTabBar::tab { background: #111; color: #666; padding: 10px 20px; border-top-left-radius: 5px; border-top-right-radius: 5px; margin-right: 2px; } QTabBar::tab:selected { background: #1e1e1e; color: #fff; border-top: 2px solid #2a82da; }")
+        
+        # Live Tab
+        self.log_table = QTableWidget()
+        self.log_table.setColumnCount(7)
+        self.log_table.setHorizontalHeaderLabels(["Time", "Device", "MAC", "SFP", "Out", "Pos", "Message"])
+        self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.log_table.verticalHeader().setVisible(False)
+        self.log_table.setSelectionMode(QTableWidget.NoSelection)
+        self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.log_table.setStyleSheet("""
+            QTableWidget { 
+                background: #0f0f0f; 
+                border: none; 
+                color: #ddd; 
+                gridline-color: #1a1a1a;
+                font-family: Consolas; 
+                font-size: 10pt;
+            }
+            QHeaderView::section {
+                background: #181818;
+                color: #888;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+                font-size: 9pt;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #1a1a1a;
+            }
+        """)
+        self.tabs.addTab(self.log_table, "LIVE MONITOR")
+        
+        # History Tab
+        hist_widget = QWidget()
+        h_lay = QVBoxLayout(hist_widget); h_lay.setContentsMargins(20,20,20,20)
+        self.history_tree = QTreeWidget(); self.history_tree.setHeaderLabels(["Date/Time", "Devices Affected", "Event Count"])
+        self.history_tree.setSelectionMode(QTreeWidget.MultiSelection)
+        self.history_tree.setStyleSheet("QTreeWidget { background: #111; border: 1px solid #333; color: #ddd; } QHeaderView::section { background: #222; color: #aaa; padding: 5px; border: none; }")
+        self.history_tree.itemClicked.connect(self.on_history_click)
+        self.history_detail = QTextEdit(); self.history_detail.setReadOnly(True); self.history_detail.setStyleSheet("background: #0f0f0f; border: 1px solid #333; color: #888; font-family: Consolas;")
+        splitter = QSplitter(Qt.Vertical); splitter.addWidget(self.history_tree); splitter.addWidget(self.history_detail); splitter.setSizes([200, 400])
+        h_lay.addWidget(splitter)
+        btn_del_hist = QPushButton("REMOVE SELECTED HISTORY")
+        btn_del_hist.setStyleSheet("background-color: #2c0b0b; color: #ff5555; padding: 10px; font-weight: bold; margin-top: 5px;")
+        btn_del_hist.clicked.connect(self.remove_selected_history)
+        h_lay.addWidget(btn_del_hist)
+        self.tabs.addTab(hist_widget, "HISTORY / BASELINES")
+        self.reload_history_tab()
+        layout.addWidget(self.tabs)
+
+    def init_sockets(self):
+        for ip, sock in self.sockets.items(): sock.stop()
+        self.sockets = {}
+        for p in self.processors:
+            ip = p.get("ip")
+            if "helios" in p.get("type", "").lower():
+                sock = HeliosSocket(ip, p.get("name"), parent=self)
+                sock.error_detected.connect(self.on_socket_error)
+                self.sockets[ip] = sock
+
+    def rebuild_list(self):
+        self.device_list.clear()
+        self.processor_widgets = {}
+        # Reset de webserver statussen bij herbouw
+        LogWebServer.device_statuses = {p['ip']: "offline" for p in self.processors if 'ip' in p}
+        
+        for p in self.processors:
+            ip = p.get('ip')
+            if not ip: continue
+            card = ProcessorCard(p.get('name', 'Unknown'), ip, p.get('type', 'Helios'))
+            card.setFixedHeight(80)
+            card.clicked.connect(self.on_card_clicked)
+            item = QListWidgetItem(self.device_list)
+            from PySide6.QtCore import QSize
+            item.setSizeHint(QSize(0, 80)) 
+            self.device_list.addItem(item)
+            self.device_list.setItemWidget(item, card)
+            self.processor_widgets[ip] = card
+
+    def on_order_changed(self, parent, start, end, destination, row):
+        new_order = []
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            card = self.device_list.itemWidget(item)
+            if card:
+                proc_data = next((p for p in self.processors if p.get('ip') == card.ip), None)
+                if proc_data: new_order.append(proc_data)
+        self.processors = new_order
+        self.config["processors"] = self.processors
+        save_config(self.config)
+        self.add_log_entry("gray", "Device order updated and saved.", "SYSTEM")
+
+    @Slot(str, str)
+    def update_visuals(self, ip, status):
+        if ip in self.processor_widgets: self.processor_widgets[ip].set_status(status, force=False)
+        LogWebServer.device_statuses[ip] = status
+
+    @Slot(str, str, str)
+    def on_socket_error(self, color, msg, ip):
+        if ip in self.processor_widgets: self.processor_widgets[ip].force_error()
+        self.add_log_entry(color, msg, ip)
+
+    @Slot(str, str, str, str)
+    def on_alert_received(self, ip, color, msg, receiver_info):
+        """Handle alert from MonitorWorker with proper color mapping."""
+        self.add_log_entry(color, msg, ip, receiver_info)
+
+    @Slot(str)
+    def on_card_clicked(self, ip):
+        self.selected_ip = None if self.selected_ip == ip else ip
+        for p_ip, card in self.processor_widgets.items(): card.set_selected(p_ip == self.selected_ip)
+        self.refresh_log_display()
+
+    def add_log_entry(self, color, msg, ip, receiver_info=None):
+        entry = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "color": color,
+            "msg": msg,
+            "ip": ip,
+            "receiver_info": receiver_info if receiver_info else {}
+        }
+        self.log_history.append(entry)
+        if self.selected_ip is None or self.selected_ip == ip or ip == "SYSTEM": 
+            self.append_log_row(entry)
+
+    def refresh_log_display(self):
+        self.log_table.setRowCount(0)
+        for entry in self.log_history:
+            if self.selected_ip is None or entry["ip"] == self.selected_ip or entry["ip"] == "SYSTEM": 
+                self.append_log_row(entry)
+
+    def append_log_row(self, entry):
+        row = self.log_table.rowCount()
+        self.log_table.insertRow(row)
+        
+        # Time
+        time_item = QTableWidgetItem(entry["time"])
+        time_item.setForeground(QColor("#888"))
+        time_item.setTextAlignment(Qt.AlignCenter)
+        self.log_table.setItem(row, 0, time_item)
+        
+        # Device (IP or SYSTEM)
+        device_text = entry["ip"] if entry["ip"] else "SYSTEM"
+        device_item = QTableWidgetItem(device_text)
+        device_item.setForeground(QColor("#888"))
+        device_item.setTextAlignment(Qt.AlignCenter)
+        self.log_table.setItem(row, 1, device_item)
+        
+        # Receiver info (MAC, SFP, Output, Chain Position)
+        receiver_info = entry.get("receiver_info", {})
+        
+        mac_text = receiver_info.get("mac", "-") if isinstance(receiver_info, dict) else "-"
+        sfp_text = receiver_info.get("sfp", "-") if isinstance(receiver_info, dict) else "-"
+        output_text = receiver_info.get("output", "-") if isinstance(receiver_info, dict) else "-"
+        chain_text = receiver_info.get("chain_pos", "-") if isinstance(receiver_info, dict) else "-"
+        
+        # MAC
+        mac_item = QTableWidgetItem(mac_text)
+        mac_item.setForeground(QColor("#ff9800") if mac_text != "-" else QColor("#444"))
+        mac_item.setTextAlignment(Qt.AlignCenter)
+        self.log_table.setItem(row, 2, mac_item)
+        
+        # SFP
+        sfp_item = QTableWidgetItem(sfp_text)
+        sfp_item.setForeground(QColor("#2a82da") if sfp_text != "-" else QColor("#444"))
+        sfp_item.setTextAlignment(Qt.AlignCenter)
+        self.log_table.setItem(row, 3, sfp_item)
+        
+        # Output
+        output_item = QTableWidgetItem(output_text)
+        output_item.setForeground(QColor("#2a82da") if output_text != "-" else QColor("#444"))
+        output_item.setTextAlignment(Qt.AlignCenter)
+        self.log_table.setItem(row, 4, output_item)
+        
+        # Chain Position
+        chain_item = QTableWidgetItem(chain_text)
+        chain_item.setForeground(QColor("#2a82da") if chain_text != "-" else QColor("#444"))
+        chain_item.setTextAlignment(Qt.AlignCenter)
+        self.log_table.setItem(row, 5, chain_item)
+        
+        # Message
+        if entry["color"] == "red":
+            c = QColor("#ff5555")
+        elif entry["color"] == "green":
+            c = QColor("#2ecc71")
+        elif entry["color"] == "orange":
+            c = QColor("#ff9800")
+        else:
+            c = QColor("#bbbbbb")
+        
+        msg_item = QTableWidgetItem(entry["msg"])
+        msg_item.setForeground(c)
+        self.log_table.setItem(row, 6, msg_item)
+        
+        self.log_table.scrollToBottom()
+
+    def clear_log(self):
+        """Slaat de huidige sessie op en start een schone lei."""
+        if self.log_history:
+            # 1. Maak de sessie aan
+            session_name = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            session = {
+                "name": session_name, 
+                "devices": "Multiple", 
+                "count": len(self.log_history), 
+                "logs": list(self.log_history) # Maak een kopie van de logs voor de geschiedenis
+            }
+            
+            # 2. Opslaan in history.json
+            self.history_data.insert(0, session)
+            save_json(HISTORY_FILE, self.history_data)
+            self.reload_history_tab()
+            
+            # 3. Maak de LIVE monitor leeg
+            # Belangrijk: gebruik .clear() om de referentie voor de webserver levend te houden
+            self.log_history.clear() 
+            LogWebServer.last_clear_time = time.time()  # Notificeer webserver van clear
+            self.log_table.setRowCount(0)
+            
+            # 4. Voeg de bevestiging toe aan de NIEUWE log
+            self.add_log_entry("green", f"Previous session saved as {session_name}. New Baseline started.", "SYSTEM")
+        else:
+            # Als de log al leeg was, resetten we alleen visueel
+            self.log_history.clear()
+            LogWebServer.last_clear_time = time.time()  # Notificeer webserver van clear
+            self.log_table.setRowCount(0)
+            self.add_log_entry("gray", "Event log cleared. Ready.", "SYSTEM")
+            
+        # 5. Reset alle foutmeldingen op de processors
+        for sock in self.sockets.values(): 
+            sock.active_errors.clear()
+            
+        for card in self.processor_widgets.values(): 
+            card.set_status("ok", force=True)
+
+    def reload_history_tab(self):
+        self.history_tree.clear()
+        for session in self.history_data:
+            item = QTreeWidgetItem([session["name"], session["devices"], str(session["count"])])
+            item.setData(0, Qt.UserRole, session["logs"])
+            self.history_tree.addTopLevelItem(item)
+
+    def on_history_click(self, item, col):
+        logs = item.data(0, Qt.UserRole)
+        self.history_detail.clear()
+        for entry in logs: self.history_detail.append(f"[{entry['time']}] {entry['ip']}: {entry['msg']}")
+
+    def remove_selected_history(self):
+        selected_items = self.history_tree.selectedItems()
+        if not selected_items: return
+        reply = QMessageBox.question(self, "Delete", f"Delete {len(selected_items)} sessions?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            for item in selected_items:
+                name = item.text(0)
+                self.history_data = [s for s in self.history_data if s['name'] != name]
+                self.history_tree.takeTopLevelItem(self.history_tree.indexOfTopLevelItem(item))
+            save_json(HISTORY_FILE, self.history_data)
+            self.history_detail.clear()
+
+    def open_settings(self):
+        dlg = SettingsDialog(self, self.processors)
+        if dlg.exec():
+            old_processors = self.processors
+            self.processors = dlg.get_processors(); self.config["processors"] = self.processors
+            save_config(self.config); self.http_worker.update_processors(self.processors)
+            self.http_worker.force_scan()  # Immediate scan!
+            for s in self.sockets.values(): s.stop()
+            self.init_sockets(); self.rebuild_list()
+            if old_processors != self.processors:
+                self.add_log_entry("green", f"Processors updated. Scanning {len(self.processors)} devices...", "SYSTEM")
+
+    def closeEvent(self, e): self.http_worker.stop(); super().closeEvent(e)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv); app.setStyle("Fusion")
+    window = LEDLoggerApp(); window.show(); sys.exit(app.exec())

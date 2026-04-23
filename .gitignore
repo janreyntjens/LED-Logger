@@ -1,0 +1,26 @@
+# --- Lokale data / secrets ---
+config.json
+history.json
+
+# --- PyInstaller output ---
+build/
+dist/
+*.manifest
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- VS Code ---
+.vscode/
+*.code-workspace
+
+# --- OS ---
+Thumbs.db
+.DS_Store
+desktop.ini
