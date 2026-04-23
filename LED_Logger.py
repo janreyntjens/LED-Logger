@@ -334,44 +334,57 @@ class NovastarCoexSocket(QObject):
         if not self._available:
             return
 
-        # 1. Reachability check via monitor_status of ctrl_model
-        val, err = self._snmp_get(COEX_OIDS["monitor_status"])
-        if err and not self.last_seen_ok:
-            # Eerste fout, log éénmalig
+        # 1. Reachability check via ctrl_model (werkt op alle COEX modellen)
+        model, err = self._snmp_get(COEX_OIDS["ctrl_model"])
+
+        # "noSuchName" / "noSuchObject" / "noSuchInstance" betekent: device antwoordt wél, alleen OID niet aanwezig
+        # Dat zien we als ONLINE (alleen netwerk/timeout = offline)
+        oid_missing_responses = ("nosuchname", "nosuchobject", "nosuchinstance")
+        device_responding = (err is None) or any(s in str(err).lower() for s in oid_missing_responses)
+
+        if not device_responding:
             err_id = "unreachable"
             if err_id not in self.active_errors:
                 self.active_errors.add(err_id)
                 self.error_detected.emit("red", f"{self.name}: SNMP unreachable ({err})", self.ip)
+            self.last_seen_ok = False
             return
 
-        if not err:
-            if not self.last_seen_ok:
-                # Just came online
-                self.last_seen_ok = True
-                self.active_errors.discard("unreachable")
-                model, _ = self._snmp_get(COEX_OIDS["ctrl_model"])
-                fw, _ = self._snmp_get(COEX_OIDS["ctrl_fw"])
-                self.error_detected.emit("green",
-                    f"{self.name}: Online | Model={model or '?'} FW={fw or '?'}", self.ip)
+        # Device responds — clear unreachable
+        if "unreachable" in self.active_errors:
+            self.active_errors.discard("unreachable")
 
-            # Check overall status
+        if not self.last_seen_ok:
+            self.last_seen_ok = True
+            fw, _ = self._snmp_get(COEX_OIDS["ctrl_fw"])
+            ctrl_name, _ = self._snmp_get(COEX_OIDS["ctrl_name"])
+            details = []
+            if model: details.append(f"Model={model}")
+            if ctrl_name: details.append(f"Name={ctrl_name}")
+            if fw: details.append(f"FW={fw}")
+            extra = " | ".join(details) if details else "responding to SNMP"
+            self.error_detected.emit("green", f"{self.name}: Online | {extra}", self.ip)
+
+        # 2. Overall monitor status (alleen checken als OID bestaat)
+        val, err = self._snmp_get(COEX_OIDS["monitor_status"])
+        if err is None and val is not None:
             try:
                 status_int = int(val)
+                err_id = "overall_status"
+                if status_int == 2:
+                    if err_id not in self.active_errors:
+                        self.active_errors.add(err_id)
+                        self.error_detected.emit("red", f"{self.name}: Overall status FAULT", self.ip)
+                elif status_int == 0:
+                    if err_id in self.active_errors:
+                        self.active_errors.discard(err_id)
+                        self.error_detected.emit("green", f"{self.name}: Overall status OK", self.ip)
             except (ValueError, TypeError):
-                status_int = -1
-            err_id = "overall_status"
-            if status_int == 2:
-                if err_id not in self.active_errors:
-                    self.active_errors.add(err_id)
-                    self.error_detected.emit("red", f"{self.name}: Overall status FAULT", self.ip)
-            elif status_int == 0:
-                if err_id in self.active_errors:
-                    self.active_errors.discard(err_id)
-                    self.error_detected.emit("green", f"{self.name}: Overall status OK", self.ip)
+                pass
 
-        # 2. Genlock status
+        # 3. Genlock status
         val, err = self._snmp_get(COEX_OIDS["genlock_status"])
-        if not err and val is not None:
+        if err is None and val is not None:
             try:
                 gl = int(val)
                 err_id = "genlock"
