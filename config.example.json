@@ -9,7 +9,11 @@
             "name": "MX2000 Pro Test",
             "ip": "192.168.1.20",
             "type": "Novastar_COEX",
-            "snmp_community": "public"
+            "snmp_community": "public",
+            "coex_backup_api_enabled": true,
+            "coex_backup_api_port": 8001,
+            "coex_backup_api_poll_interval": 10,
+            "coex_backup_api_log_every_poll": true
         }
     ]
 }

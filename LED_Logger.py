@@ -1763,6 +1763,10 @@ class LEDLoggerApp(QMainWindow):
         QTimer.singleShot(1000, self.http_worker.start)
         self.init_sockets()
 
+        # Geen processors geconfigureerd → open automatisch Device Manager
+        if not self.processors:
+            QTimer.singleShot(500, self.open_settings)
+
     def run_web_server(self):
         """Web server draait in aparte thread met error handling."""
         port = 8090
