@@ -20,7 +20,7 @@ try:
         QComboBox, QScrollArea, QTabWidget, QTreeWidget, QTreeWidgetItem, 
         QHeaderView, QSplitter, QTableWidget, QTableWidgetItem, QCheckBox
     )
-    from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QUrl, QObject
+    from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QUrl, QObject, QMetaObject
     from PySide6.QtGui import QPalette, QColor, QIcon, QFont
     from PySide6.QtWebSockets import QWebSocket
     from PySide6.QtNetwork import QAbstractSocket 
@@ -339,12 +339,23 @@ class NovastarCoexSocket(QObject):
             self._asyncio = None
             self._snmp = {}
 
-        # Poll timer (korter interval voor snellere ketenfout-detectie)
-        self.poll_timer = QTimer(self)
+        # Polling wordt in een eigen QThread gestart via start_polling().
+        self.poll_timer = None
+        try:
+            last_octet = int(self.ip.split(".")[-1])
+        except Exception:
+            last_octet = 0
+        self.initial_delay_ms = 400 + ((last_octet % 10) * 140)
+
+    @Slot()
+    def start_polling(self):
+        if self.poll_timer is not None:
+            return
+        self.poll_timer = QTimer()
+        self.poll_timer.setInterval(2000)  # elke 2s
         self.poll_timer.timeout.connect(self.poll_health)
-        self.poll_timer.start(2000)  # elke 2s
-        # Eerste scan na 1s zodat GUI eerst klaar is
-        QTimer.singleShot(1000, self.poll_health)
+        QTimer.singleShot(self.initial_delay_ms, self.poll_health)
+        QTimer.singleShot(self.initial_delay_ms, self.poll_timer.start)
 
     def _poll_backup_status_api(self):
         """Poll backupStatus via HTTP API (geen interval check - direct aanroepen)"""
@@ -432,6 +443,13 @@ class NovastarCoexSocket(QObject):
                     self.ip,
                 )
             return
+
+    @Slot()
+    def trigger_backup_poll_on_error(self):
+        """Run backup poll + immediate health poll in de COEX worker-thread."""
+        self._backup_poll_on_error_done = False
+        self._poll_backup_status_api()
+        self.poll_health()
 
     def _run_async(self, coro):
         """Voer een coroutine uit in een tijdelijke event loop en ruim alle pending tasks netjes op.
@@ -581,6 +599,7 @@ class NovastarCoexSocket(QObject):
                 f"{self.name}: Auto-trap-config niet volledig gelukt (mogelijk firmware beperking of SNMP write-rechten). "
                 f"Stel handmatig in via VMP (Trap server: {target}){detail_txt}", self.ip)
 
+    @Slot()
     def poll_health(self):
         """Vraagt key OIDs op en emit alerts bij verandering."""
         # Reset poll-on-error flag als alle errors opgelost zijn
@@ -591,7 +610,8 @@ class NovastarCoexSocket(QObject):
             return
 
         # 1. Reachability check via ctrl_model (werkt op alle COEX modellen)
-        model, err = self._snmp_get(COEX_OIDS["ctrl_model"])
+        # Korte timeout hier voorkomt dat offline devices de GUI blokkeren.
+        model, err = self._snmp_get(COEX_OIDS["ctrl_model"], timeout=0.35)
 
         # "noSuchName" / "noSuchObject" / "noSuchInstance" betekent: device antwoordt wél, alleen OID niet aanwezig
         # Dat zien we als ONLINE (alleen netwerk/timeout = offline)
@@ -706,9 +726,11 @@ class NovastarCoexSocket(QObject):
 
         # 6. API backup-status polling gebeurt al bovenaan deze methode.
 
+    @Slot()
     def stop(self):
         try:
-            self.poll_timer.stop()
+            if self.poll_timer is not None:
+                self.poll_timer.stop()
         except Exception:
             pass
 
@@ -1726,7 +1748,7 @@ class LEDLoggerApp(QMainWindow):
         self.config = load_json(CONFIG_FILE, {"processors": []})
         self.history_data = load_json(HISTORY_FILE, [])
         self.processors = self.config["processors"]
-        self.processor_widgets = {}; self.sockets = {}; self.selected_ip = None; self.log_history = []
+        self.processor_widgets = {}; self.sockets = {}; self.coex_threads = {}; self.selected_ip = None; self.log_history = []
         self.trap_listener = None
         
         # Basis UI setup
@@ -1926,7 +1948,16 @@ class LEDLoggerApp(QMainWindow):
         layout.addWidget(self.tabs)
 
     def init_sockets(self):
-        for ip, sock in self.sockets.items(): sock.stop()
+        for ip, sock in self.sockets.items():
+            if not isinstance(sock, NovastarCoexSocket):
+                sock.stop()
+        for ip, t in self.coex_threads.items():
+            sock = self.sockets.get(ip)
+            if isinstance(sock, NovastarCoexSocket):
+                QMetaObject.invokeMethod(sock, "stop", Qt.QueuedConnection)
+            t.quit()
+            t.wait(1200)
+        self.coex_threads = {}
         self.sockets = {}
         for p in self.processors:
             ip = p.get("ip")
@@ -1951,10 +1982,16 @@ class LEDLoggerApp(QMainWindow):
                     api_backup_poll_interval=backup_api_poll_interval,
                     api_backup_log_every_poll=backup_api_log_every_poll,
                     api_backup_port=backup_api_port,
-                    parent=self,
+                    parent=None,
                 )
                 sock.error_detected.connect(self.on_socket_error)
                 self.sockets[ip] = sock
+                t = QThread(self)
+                sock.moveToThread(t)
+                t.started.connect(sock.start_polling)
+                t.finished.connect(sock.deleteLater)
+                self.coex_threads[ip] = t
+                t.start()
 
         # Start trap listener één keer (niet per processor)
         has_coex = any("coex" in p.get("type", "").lower() or "novastar" in p.get("type", "").lower()
@@ -2047,6 +2084,14 @@ class LEDLoggerApp(QMainWindow):
         receiver_info = self._receiver_info_from_coex_trap(msg)
         self.add_log_entry(color, msg, ip, receiver_info=receiver_info, oid=oid)
 
+        # Sync Genlock trap-state met poll-state om dubbele meldingen te vermijden.
+        sock = self.sockets.get(ip)
+        if isinstance(sock, NovastarCoexSocket) and "genlock" in msg.lower():
+            if color in ("red", "orange"):
+                sock.active_errors.add("genlock")
+            elif color == "green":
+                sock.active_errors.discard("genlock")
+
         # Update processor balkje op basis van trap-kleur
         if ip in self.processor_widgets:
             card = self.processor_widgets[ip]
@@ -2062,11 +2107,7 @@ class LEDLoggerApp(QMainWindow):
         if color == "red" and "eth port" in msg.lower():
             sock = self.sockets.get(ip)
             if isinstance(sock, NovastarCoexSocket):
-                # Reset flag zodat volgende Eth port error ook pollt
-                sock._backup_poll_on_error_done = False
-                sock._poll_backup_status_api()
-            # Forceer direct extra SNMP check na de trap voor snellere follow-up.
-            QTimer.singleShot(0, sock.poll_health)
+                QMetaObject.invokeMethod(sock, "trigger_backup_poll_on_error", Qt.QueuedConnection)
         
         # Traps bevatten niet altijd volledige context (bijv. HDMI status).
         # Doe daarom meteen een extra poll op dezelfde COEX, zodat poll-OIDs
@@ -2074,7 +2115,7 @@ class LEDLoggerApp(QMainWindow):
         if msg.startswith("TRAP_RAW:"):
             sock = self.sockets.get(ip)
             if isinstance(sock, NovastarCoexSocket):
-                QTimer.singleShot(0, sock.poll_health)
+                QMetaObject.invokeMethod(sock, "poll_health", Qt.QueuedConnection)
 
     def rebuild_list(self):
         self.device_list.clear()
@@ -2179,12 +2220,16 @@ class LEDLoggerApp(QMainWindow):
             self.append_log_row(entry)
 
     def refresh_log_display(self):
+        self.log_table.setUpdatesEnabled(False)
         self.log_table.setRowCount(0)
         for entry in self.log_history:
-            if self.selected_ip is None or entry["ip"] == self.selected_ip or entry["ip"] == "SYSTEM": 
-                self.append_log_row(entry)
+            if self.selected_ip is None or entry["ip"] == self.selected_ip or entry["ip"] == "SYSTEM":
+                self.append_log_row(entry, auto_scroll=False)
+        self.log_table.setUpdatesEnabled(True)
+        self.log_table.viewport().update()
+        self.log_table.scrollToBottom()
 
-    def append_log_row(self, entry):
+    def append_log_row(self, entry, auto_scroll=True):
         row = self.log_table.rowCount()
         self.log_table.insertRow(row)
         
@@ -2253,7 +2298,8 @@ class LEDLoggerApp(QMainWindow):
         oid_item.setForeground(QColor("#666666") if not oid_text else QColor("#aaaaaa"))
         self.log_table.setItem(row, 7, oid_item)
         
-        self.log_table.scrollToBottom()
+        if auto_scroll:
+            self.log_table.scrollToBottom()
 
     def clear_log(self):
         """Slaat de huidige sessie op en start een schone lei."""
@@ -2325,12 +2371,22 @@ class LEDLoggerApp(QMainWindow):
             self.processors = dlg.get_processors(); self.config["processors"] = self.processors
             save_config(self.config); self.http_worker.update_processors(self.processors)
             self.http_worker.force_scan()  # Immediate scan!
-            for s in self.sockets.values(): s.stop()
             self.init_sockets(); self.rebuild_list()
             if old_processors != self.processors:
                 self.add_log_entry("green", f"Processors updated. Scanning {len(self.processors)} devices...", "SYSTEM")
 
-    def closeEvent(self, e): self.http_worker.stop(); super().closeEvent(e)
+    def closeEvent(self, e):
+        self.http_worker.stop()
+        for ip, sock in self.sockets.items():
+            if not isinstance(sock, NovastarCoexSocket):
+                sock.stop()
+        for ip, t in self.coex_threads.items():
+            sock = self.sockets.get(ip)
+            if isinstance(sock, NovastarCoexSocket):
+                QMetaObject.invokeMethod(sock, "stop", Qt.QueuedConnection)
+            t.quit()
+            t.wait(1200)
+        super().closeEvent(e)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv); app.setStyle("Fusion")
