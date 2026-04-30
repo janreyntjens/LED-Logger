@@ -1553,7 +1553,8 @@ class ProcessorCard(QFrame):
 
     def set_status(self, s, force=False):
         # offline mag altijd gezet worden (netwerk weg); anders sticky error bewaren
-        if not force and s == "ok" and self.had_error: return
+        if not force and s == "ok" and self.had_error:
+            self.status = "error"; self.update_style(); return
         self.status = s; self.update_style()
 
     def force_error(self): self.had_error = True; self.status = "error"; self.update_style()
