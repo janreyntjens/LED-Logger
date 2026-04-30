@@ -1,6 +1,6 @@
-# HELIOS LOGGER
+# LED Logger
 
-GUI tool om errors en alerts van LED processors (Helios) te loggen via WebSocket.
+GUI tool om errors en alerts van LED processors te loggen via SNMP traps en WebSocket.
 
 ## Stack
 - Python 3.x + PySide6 (Qt)
