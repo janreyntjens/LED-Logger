@@ -9,7 +9,7 @@ import hashlib
 import hmac
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 
 # --- VEILIGE IMPORT ---
@@ -1820,6 +1820,8 @@ class LEDLoggerApp(QMainWindow):
         self.processors = self.config["processors"]
         self.processor_widgets = {}; self.sockets = {}; self.coex_threads = {}; self.selected_ip = None; self.log_history = []
         self.trap_listener = None
+        self.web_server = None
+        self.web_thread = None
         
         # Basis UI setup
         self.setup_ui()
@@ -1828,27 +1830,9 @@ class LEDLoggerApp(QMainWindow):
         LogWebServer.log_data = self.log_history
         LogWebServer.device_statuses = {p['ip']: "offline" for p in self.processors if 'ip' in p}
         self._apply_web_auth()
-        
-        # --- WEB SERVER SETUP (Main Thread safe) ---
-        port = 8090
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            url = f"http://{local_ip}:{port}"
-        except:
-            url = f"http://localhost:{port}"
 
-        # Update de GUI (Titel en Log) direct vanuit de Main Thread
-        self.setWindowTitle(f"{APP_NAME} - {VERSION} | Remote Log: {url}")
-        self.set_remote_monitor_url(url)
-        self.add_log_entry("green", f"REMOTE MONITOR ACTIVE: {url}", "SYSTEM")
-        
-        # Start nu de server thread zonder dat deze GUI-acties hoeft te doen
-        self.web_thread = threading.Thread(target=self.run_web_server, daemon=True)
-        self.web_thread.start()
-        # -------------------------------------------
+        # Start webserver en toon pas "active" als bind echt gelukt is.
+        self.start_web_server()
 
         self.http_worker = MonitorWorker(self.processors)
         self.http_worker.status_signal.connect(self.update_visuals)
@@ -1860,24 +1844,53 @@ class LEDLoggerApp(QMainWindow):
         if not self.processors:
             QTimer.singleShot(500, self.open_settings)
 
-    def run_web_server(self):
-        """Web server draait in aparte thread met error handling."""
-        port = 8090
+    def _detect_local_ip(self):
         try:
-            print(f"[WEBSERVER] Poging om server te starten op 0.0.0.0:{port}...")
-            server = HTTPServer(("0.0.0.0", port), LogWebServer)
-            print(f"[WEBSERVER] Server succesvol gestart op poort {port}")
-            server.serve_forever()
-        except OSError as e:
-            if e.errno == 10048:  # Windows: Address already in use
-                print(f"[WEBSERVER ERROR] Poort {port} is al in gebruik! Server niet gestart.")
-                print(f"[WEBSERVER] Sluit andere applicaties die poort {port} gebruiken.")
-            else:
-                print(f"[WEBSERVER ERROR] Kan niet binden aan poort {port}: {e}")
-        except Exception as e:
-            print(f"[WEBSERVER ERROR] Onverwachte fout bij starten webserver: {e}")
-            import traceback
-            traceback.print_exc()
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            if local_ip and local_ip != "0.0.0.0":
+                return local_ip
+        except Exception:
+            pass
+
+        try:
+            host_ip = socket.gethostbyname(socket.gethostname())
+            if host_ip and not host_ip.startswith("127."):
+                return host_ip
+        except Exception:
+            pass
+
+        return "localhost"
+
+    def start_web_server(self):
+        """Start de remote monitor server en geef duidelijke status in de GUI."""
+        local_ip = self._detect_local_ip()
+        preferred_ports = (8090, 8091, 8092, 8093, 8094)
+        last_error = None
+
+        for port in preferred_ports:
+            try:
+                self.web_server = ThreadingHTTPServer(("0.0.0.0", port), LogWebServer)
+                url = f"http://{local_ip}:{port}"
+                self.setWindowTitle(f"{APP_NAME} - {VERSION} | Remote Log: {url}")
+                self.set_remote_monitor_url(url)
+                self.add_log_entry("green", f"REMOTE MONITOR ACTIVE: {url}", "SYSTEM")
+                self.web_thread = threading.Thread(target=self.web_server.serve_forever, daemon=True)
+                self.web_thread.start()
+                return True
+            except OSError as e:
+                last_error = e
+
+        self.remote_monitor_url = ""
+        self.setWindowTitle(f"{APP_NAME} - {VERSION} | Remote Log: unavailable")
+        self.remote_url_label.setText('<span style="color:#ff8888;">Remote log unavailable</span>')
+        self.remote_url_label.setToolTip(str(last_error) if last_error else "Unknown startup error")
+        self.btn_copy_remote_url.setEnabled(False)
+        err_txt = str(last_error) if last_error else "unknown startup error"
+        self.add_log_entry("red", f"REMOTE MONITOR FAILED: {err_txt}", "SYSTEM")
+        return False
 
     def _ensure_web_auth_config(self):
         web_auth = self.config.get("web_auth")
@@ -2477,6 +2490,19 @@ class LEDLoggerApp(QMainWindow):
 
     def closeEvent(self, e):
         self.http_worker.stop()
+
+        if self.web_server is not None:
+            try:
+                self.web_server.shutdown()
+                self.web_server.server_close()
+            except Exception:
+                pass
+        if self.web_thread is not None and self.web_thread.is_alive():
+            try:
+                self.web_thread.join(timeout=1.2)
+            except Exception:
+                pass
+
         for ip, sock in self.sockets.items():
             if not isinstance(sock, NovastarCoexSocket):
                 sock.stop()
