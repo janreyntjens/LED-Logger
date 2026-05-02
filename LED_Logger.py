@@ -4,6 +4,7 @@ import time
 import json
 import socket
 import traceback
+import ctypes
 import base64
 import hashlib
 import hmac
@@ -46,6 +47,7 @@ CONFIG_FILE = os.path.join(APP_BASE_DIR, "config.json")
 HISTORY_FILE = os.path.join(APP_BASE_DIR, "history.json")
 WEB_DEFAULT_USERNAME = "admin"
 WEB_DEFAULT_PASSWORD = "1234"
+WINDOWS_APP_USER_MODEL_ID = "janreyntjens.LEDLogger"
 
 
 def hash_password(password):
@@ -77,6 +79,15 @@ def save_json(file, data):
     try:
         with open(file, 'w') as f: json.dump(data, f, indent=4)
     except: pass
+
+def set_windows_app_user_model_id():
+    """Helps Windows map the running process to the packaged .exe icon in the taskbar."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_USER_MODEL_ID)
+    except Exception:
+        pass
 
 # ==========================================
 #       MODULES
@@ -2693,6 +2704,7 @@ class LEDLoggerApp(QMainWindow):
         super().closeEvent(e)
 
 if __name__ == "__main__":
+    set_windows_app_user_model_id()
     app = QApplication(sys.argv); app.setStyle("Fusion")
     app.setWindowIcon(QIcon(resource_path(LOGO_FILE)))
     window = LEDLoggerApp(); window.setWindowIcon(QIcon(resource_path(LOGO_FILE))); window.show(); sys.exit(app.exec())
